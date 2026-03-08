@@ -1,6 +1,6 @@
 # 🐳 Docker Status Monitor
 
-A lightweight, desktop GUI application for real-time monitoring of Docker containers in CLI environments. Built with Python and Tkinter, it provides at-a-glance visibility into container health, uptime, notification-pane for available image updates, and user-initiated options to update containers with the latest images — all from a compact, dark-themed window.
+A lightweight desktop GUI application for real-time monitoring of Docker containers in CLI environments. Built with Python and Tkinter, it provides at-a-glance visibility into container health, uptime, a notification pane for image updates, and user-initiated options to pull the latest images and update containers — all from a compact, dark-themed window.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey?logo=linux&logoColor=white)
