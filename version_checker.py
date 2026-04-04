@@ -168,10 +168,14 @@ def get_running_container_images() -> Dict[str, dict]:
                     # Get local image creation date
                     local_created = get_local_image_created(image)
                     
+                    # Get image ID (config digest) for GHCR/LSCR comparison
+                    image_id = get_local_image_id(image)
+                    
                     containers[name] = {
                         "image": image,
                         "container_id": container_id,
                         "local_digest": digest,
+                        "local_image_id": image_id,
                         "local_created": local_created
                     }
     
@@ -213,6 +217,20 @@ def get_local_image_digest(image: str) -> Optional[str]:
             if '@' in digest_full:
                 return digest_full.split('@')[1]
             return digest_full
+    except:
+        pass
+    return None
+
+
+def get_local_image_id(image: str) -> Optional[str]:
+    """Get the image ID (config digest) of a local Docker image."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
     except:
         pass
     return None
@@ -424,71 +442,124 @@ def check_dockerhub_update(repository: str, tag: str, local_digest: Optional[str
         return {"error": str(e)}
 
 
-def check_ghcr_update(repository: str, tag: str, local_digest: Optional[str]) -> Optional[dict]:
+def check_ghcr_update(repository: str, tag: str, local_image_id: Optional[str]) -> Optional[dict]:
     """
     Check GitHub Container Registry for updates.
-    Note: This requires authentication for private repos.
+    Compares config digests (image IDs) by walking the OCI manifest chain:
+    tag -> OCI index -> amd64 manifest -> config digest
     """
     try:
-        # GHCR uses OCI distribution API
-        # For public images, we can get the manifest
-        url = f"https://ghcr.io/v2/{repository}/manifests/{tag}"
-        
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Docker-Status-Monitor/1.0',
-            'Accept': 'application/vnd.docker.distribution.manifest.v2+json'
+        # Step 1: Get a bearer token (required even for public images)
+        token_url = f"https://ghcr.io/token?scope=repository:{repository}:pull"
+        token_req = urllib.request.Request(token_url, headers={
+            'User-Agent': 'Docker-Status-Monitor/1.0'
         })
+        with urllib.request.urlopen(token_req, timeout=10) as response:
+            token_data = json.loads(response.read().decode())
+            token = token_data.get('token', '')
         
-        with urllib.request.urlopen(req, timeout=10) as response:
-            # The digest is often in the Docker-Content-Digest header
-            remote_digest = response.headers.get('Docker-Content-Digest', '')
-            
-            if local_digest and remote_digest:
-                if local_digest != remote_digest:
+        if not token:
+            return {"error": "Could not obtain GHCR auth token"}
+        
+        auth_headers = {
+            'User-Agent': 'Docker-Status-Monitor/1.0',
+            'Authorization': f'Bearer {token}'
+        }
+        
+        # Step 2: Get OCI index / manifest list and find amd64/linux manifest
+        index_url = f"https://ghcr.io/v2/{repository}/manifests/{tag}"
+        index_req = urllib.request.Request(index_url, headers={
+            **auth_headers,
+            'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+        })
+        with urllib.request.urlopen(index_req, timeout=10) as response:
+            index_data = json.loads(response.read().decode())
+        
+        # Find amd64/linux manifest digest from the index
+        amd64_digest = None
+        manifests = index_data.get('manifests', [])
+        if manifests:
+            for m in manifests:
+                platform = m.get('platform', {})
+                if platform.get('architecture') == 'amd64' and platform.get('os') == 'linux':
+                    amd64_digest = m['digest']
+                    break
+        else:
+            # Not a multi-arch image — config digest is directly in this manifest
+            config_digest = index_data.get('config', {}).get('digest', '')
+            if config_digest and local_image_id:
+                if local_image_id != config_digest:
                     return {
                         "has_update": True,
-                        "local_digest": local_digest[:16] + "..." if local_digest else "unknown",
-                        "remote_digest": remote_digest[:16] + "..." if remote_digest else "unknown",
+                        "local_digest": local_image_id[:23] + "..." if local_image_id else "unknown",
+                        "remote_digest": config_digest[:23] + "..." if config_digest else "unknown",
                         "registry": "GitHub Container Registry"
                     }
-            
-            return {
-                "has_update": False,
-                "registry": "GitHub Container Registry"
-            }
+                return {"has_update": False, "registry": "GitHub Container Registry"}
+            return {"error": "Could not parse GHCR manifest"}
+        
+        if not amd64_digest:
+            return {"error": "Could not find amd64/linux manifest in GHCR index"}
+        
+        # Step 3: Get the amd64 manifest and extract config digest (= image ID)
+        manifest_url = f"https://ghcr.io/v2/{repository}/manifests/{amd64_digest}"
+        manifest_req = urllib.request.Request(manifest_url, headers={
+            **auth_headers,
+            'Accept': 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+        })
+        with urllib.request.urlopen(manifest_req, timeout=10) as response:
+            manifest_data = json.loads(response.read().decode())
+        
+        remote_config_digest = manifest_data.get('config', {}).get('digest', '')
+        
+        if not remote_config_digest:
+            return {"error": "Could not extract config digest from GHCR manifest"}
+        
+        # Step 4: Compare config digests (image IDs)
+        if local_image_id and remote_config_digest:
+            if local_image_id != remote_config_digest:
+                return {
+                    "has_update": True,
+                    "local_digest": local_image_id[:23] + "..." if local_image_id else "unknown",
+                    "remote_digest": remote_config_digest[:23] + "..." if remote_config_digest else "unknown",
+                    "registry": "GitHub Container Registry"
+                }
+        
+        return {
+            "has_update": False,
+            "registry": "GitHub Container Registry"
+        }
     
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return {"error": "Authentication required (private repo?)"}
+            return {"error": "Authentication failed for GHCR"}
         elif e.code == 404:
-            return {"error": f"Image not found on GHCR"}
+            return {"error": "Image not found on GHCR"}
         return {"error": f"HTTP {e.code}"}
     except Exception as e:
         return {"error": str(e)}
 
 
-def check_lscr_update(repository: str, tag: str, local_digest: Optional[str]) -> Optional[dict]:
+def check_lscr_update(repository: str, tag: str, local_image_id: Optional[str]) -> Optional[dict]:
     """
     Check LinuxServer.io Container Registry for updates.
     LSCR mirrors to GitHub Container Registry.
     """
     # lscr.io images are hosted on ghcr.io under linuxserver organization
     ghcr_repo = f"linuxserver/{repository.split('/')[-1]}"
-    result = check_ghcr_update(ghcr_repo, tag, local_digest)
+    result = check_ghcr_update(ghcr_repo, tag, local_image_id)
     if result:
         result["registry"] = "LinuxServer.io (LSCR)"
     return result
 
 
-def check_image_update(image: str, local_digest: Optional[str]) -> dict:
+def check_image_update(image: str, local_digest: Optional[str], local_image_id: Optional[str] = None) -> dict:
     """Check if an image has an update available."""
     registry, repository, tag = parse_image_name(image)
     
     # Check if version is pinned (not :latest or untagged)
-    is_pinned_version = tag not in ("latest", "") and not tag.startswith("v") == False
-    # More specific: pinned if it looks like a semver (has numbers and dots)
-    import re as re_module
-    is_pinned_version = bool(re_module.match(r'^v?\d+[\.\d]*', tag)) if tag and tag != "latest" else False
+    # Pinned if it looks like a semver (has numbers and dots)
+    is_pinned_version = bool(re.match(r'^v?\d+[\.\d]*', tag)) if tag and tag != "latest" else False
     
     result = {
         "image": image,
@@ -502,9 +573,9 @@ def check_image_update(image: str, local_digest: Optional[str]) -> dict:
     if registry in ("docker.io", "index.docker.io"):
         update_info = check_dockerhub_update(repository, tag, local_digest)
     elif registry == "ghcr.io":
-        update_info = check_ghcr_update(repository, tag, local_digest)
+        update_info = check_ghcr_update(repository, tag, local_image_id)
     elif registry == "lscr.io":
-        update_info = check_lscr_update(repository, tag, local_digest)
+        update_info = check_lscr_update(repository, tag, local_image_id)
     else:
         # Unknown registry - can't check
         update_info = {"error": f"Unsupported registry: {registry}"}
@@ -555,6 +626,7 @@ def check_all_updates(force: bool = False) -> List[dict]:
                 # Container names often follow pattern: project_service_1 or project-service-1
                 matching_container = None
                 local_digest = None
+                local_image_id = None
                 local_created = None
                 
                 for container_name, container_info in running_containers.items():
@@ -567,12 +639,13 @@ def check_all_updates(force: bool = False) -> List[dict]:
                         if project_lower in container_lower or service_name.lower() in container_lower:
                             matching_container = container_name
                             local_digest = container_info.get("local_digest")
+                            local_image_id = container_info.get("local_image_id")
                             local_created = container_info.get("local_created")
                             break
                 
                 if matching_container:
                     # Check for updates
-                    update_result = check_image_update(image, local_digest)
+                    update_result = check_image_update(image, local_digest, local_image_id)
                     update_result["project"] = project_name
                     update_result["service"] = service_name
                     update_result["container"] = matching_container
